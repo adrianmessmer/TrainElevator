@@ -19,6 +19,7 @@ Bug fix 1: no power on elevator after initialisation w/o highth adjustment
 Bug fix 2: wrong level after initialisation w/o highth adjustment
 Bug fix 3: get rid of false interrupt after initialisation
 Bug fix 4: changed max value from 4000 to 3800
+Bug fix 5: displayed text fixed
 
 */
 
@@ -158,7 +159,7 @@ void setup() {
   lcd.print("Train Elevator"); // You can make spaces using well... spaces
   lcd.setCursor(0, 1); // Or setting the cursor in the desired position.
   lcd.print(release);
-  delay(100);
+  delay(1000);
   
 //================= Configure SPI ======================================
   
@@ -215,6 +216,9 @@ void setup() {
   
   if (zValue < 10 && zValue > -10 && yValue < -1800) {
     Serial.println("Valid reset parking position detected");
+    lcd.print("Calibration OK!");
+    delay(1000);
+    lcd.clear();
     lcd.print("Reset position");
     lcd.setCursor(0, 1);
     lcd.print("Level 1");
@@ -226,6 +230,7 @@ void setup() {
   } else {
     Serial.println("Invalid reset parking position detected");
     Serial.println("Moving to lowest level");
+    lcd.print("Calibration needed!");
     delay(1000);
     lcd.clear();
     moveMin(0); 
