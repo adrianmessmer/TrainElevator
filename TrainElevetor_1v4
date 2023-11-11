@@ -1,0 +1,840 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <MCP23017.h>
+#include <LCD_I2C.h>
+
+#define MCP23017_ADDR 0x26
+#define LCD2004_ADDR 0x27
+
+MCP23017 mcp = MCP23017(MCP23017_ADDR);
+LCD_I2C lcd(LCD2004_ADDR, 20, 4);
+
+const byte address = 0x20;
+
+String release = "Release 1v4";
+
+/* Release under test, Alvesta Aug 5, 2022
+
+Bug fix 1: no power on elevator after initialisation w/o highth adjustment
+Bug fix 2: wrong level after initialisation w/o highth adjustment
+Bug fix 3: get rid of false interrupt after initialisation
+
+*/
+
+const byte LED1 = 0b00000001;
+const byte LED2 = 0b00000010;
+const byte LED3 = 0b00000100;
+const byte LED4 = 0b00001000;
+const byte LED5 = 0b00100000;
+const byte LED6 = 0b01000000;
+const byte CMDSENTLED = 0b10000000;
+const byte ERRORLED = 0b00010000;
+const byte NOLED = 0b00000000;
+
+/*
+  For more TMAG5170 sensor information:
+  https://www.ti.com/lit/ds/symlink/tmag5170-q1.pdf?ts=1605622801161&ref_url=https%253A%252F%252Fwww.ti.com%252Fproduct%252FTMAG5170-Q1%253FkeyMatch%253DTMAG5170-Q1%2B%2526tisearch%253DSearch-EN-everything%2526usecase%253DGPN
+  DRDY: pin ____
+  CS: pin 7
+  MOSI: pin 11
+  MISO: pin 12
+  SCK: pin 13
+*/
+
+// Sensor's memory register addresses
+const int DEVICE_CONFIG = 0x00; //0x0 is used for writes, should really handle this in the read command
+const int SENSOR_CONFIG = 0x01;
+const int SYSTEM_CONFIG = 0x02; // this is where we can switch to the 12bit XY sampling mode
+const int TEST_CONFIG = 0x0F;
+const int X_CH_RESULT = 0x89; //0x8 is used for reads, should really handle this in the write command
+const int Y_CH_RESULT = 0x8A;
+const int Z_CH_RESULT = 0x8B;
+const int TEMP_RESULT = 0x8C;
+
+// SPI chip select pin
+const uint8_t chipSelectPin = 7;
+
+int16_t yValue = 0;
+int16_t zValue = 0;
+
+#include <BTS7960.h>
+
+// Motordrive control pinst
+const uint8_t EN = 8;
+const uint8_t L_PWM = 9;
+const uint8_t R_PWM = 10;
+
+BTS7960 motorController(EN, L_PWM, R_PWM);
+
+const byte motorStop = 0;
+const byte motorRun = 1;
+
+// Motor speeds:
+const byte fullSpeed = 255;
+const byte slowSpeed = 70;
+
+// Thresholds for maximum zValue when reaching top or bottom end
+const int max = 4000;
+
+#include <Bounce2.h>
+
+// Control button pins
+const int STOP_BUTTON = 2;
+const int MODE_BUTTON = 4;
+const int UP_BUTTON = 5;
+const int DOWN_BUTTON = 6;
+
+// Number of loops to debounce interrupt
+const int interruptDebounce = 1;
+
+// Threshold for long pressed is 1 sec
+const unsigned long longTime = 1000;
+
+unsigned long buttonPressStartTimeStamp;
+unsigned long buttonPressDuration;
+boolean startTimeout = false;
+boolean endTimeout = false;
+
+// edge indicates whether a falling edge of the UP or DOWN button, or no valid edge was detected
+byte edge = 0;
+
+const byte noValidEdge = 0;
+const byte fallingEdgeUp = 1;
+const byte fallingEdgeDown = 2;
+const byte fallingEdgeMode = 3;
+
+// the state variable is used withing the motor closed loop modes moveMax, moveMin, moveUp, moveDown 
+volatile byte state = 0;
+
+// event indicates which button was pressed and whether it was pressed short or long
+byte event = 0;
+
+// list of all possible events
+const byte noEvent = 0;
+const byte shortPressUp = 1;
+const byte longPressUp = 2;
+const byte shortPressDown = 3;
+const byte longPressDown = 4;
+const byte shortPressMode = 5;
+const byte longPressMode = 6;
+const byte twoPressed = 7;
+
+// emergency indicates that an interrupt was detected triggering an emergency stop
+volatile byte emergency = 0;
+volatile int falseInterrupts = 0;
+
+// manual enable will drinve the motor in open loop mode without any position sensing
+bool manualModeEnable = 0;
+
+// Test mode enable, if set 1 the motor acting and position sensing is bypassed
+bool testModeEnable = 0;
+
+// initialisation of the debounced button objects
+Bounce2::Button debounce_up = Bounce2::Button();
+Bounce2::Button debounce_down = Bounce2::Button();
+Bounce2::Button debounce_mode = Bounce2::Button();
+
+// Motor status, if running, the buttons are set inactive, except emergency stop
+byte motorStatus = motorStop;
+
+// Level indicates the position of the elevator
+byte level = 1;
+
+void setup() {
+  
+//================= Turn on LCD Backlight ==============================
+
+  Wire.begin();
+
+  mcp.init();
+  mcp.portMode(MCP23017Port::A, 0b00000000); //Port A as output
+  mcp.portMode(MCP23017Port::B, 0b00000000); //Port B as output
+      
+  lcd.begin(); // If you are using more I2C devices using the Wire library use lcd.begin(false)
+               // this stop the library(LCD_I2C) from calling Wire.begin()
+  lcd.backlight();
+  
+  lcd.print("Train Elevator"); // You can make spaces using well... spaces
+  lcd.setCursor(0, 1); // Or setting the cursor in the desired position.
+  lcd.print(release);
+  delay(100);
+  
+//================= Configure SPI ======================================
+  
+  pinMode(chipSelectPin, OUTPUT); // chip select pin for SPI
+  Serial.begin(9600);
+  while (!Serial); // hold setup while serial starts up
+  SPI.begin(); // start the SPI library:
+  SPI.setDataMode(0);
+  SPI.setBitOrder(MSBFIRST);
+
+  //Configure sensor with syntax (address,dataA, dataB,command+CRC)
+  writeRegister(TEST_CONFIG, 0x00, 0x04, 0x07); // from TI support - write a 0x0F000407 which disables CRC in the test config addres //https://e2e.ti.com/support/sensors/f/1023/t/937812
+  delay(50);
+  writeRegister(SENSOR_CONFIG, 0x19, 0xEA, 0x00);  //0x1 = SENSOR_CONFIG: Configure X,Y, and Z RANGE to be +/-100mT, as well as activating them (they default to off)
+  delay(50);
+  writeRegister(DEVICE_CONFIG, 0b00110001, 0x20, 0x00); // 0x0 = DEVICE_CONFIG: Set to 8x averaging + no temp coefficient + set to active measure mode + disable temp stuff
+  delay(100); // give the sensor time to set up:
+
+//================= Configure Buttons =================================
+
+  debounce_up.attach(UP_BUTTON, INPUT_PULLUP); // Attach the debouncer to a pin with INPUT_PULLUP mode
+  debounce_up.interval(5); // Use a debounce interval of 25 milliseconds
+  debounce_up.setPressedState(LOW);
+
+  debounce_down.attach(DOWN_BUTTON, INPUT_PULLUP); // Attach the debouncer to a pin with INPUT_PULLUP mode
+  debounce_down.interval(5); // Use a debounce interval of 25 milliseconds
+  debounce_down.setPressedState(LOW);
+  
+  debounce_mode.attach(MODE_BUTTON, INPUT_PULLUP); // Attach the debouncer to a pin with INPUT_PULLUP mode
+  debounce_mode.interval(5); // Use a debounce interval of 25 milliseconds
+  debounce_mode.setPressedState(LOW);
+  
+  pinMode(STOP_BUTTON, INPUT_PULLUP); // interrupt pin for emergeny stop
+
+//================= Initialize Motor Driver ===========================
+
+  motorController.Enable();
+  motorController.TurnLeft(0);
+  delay(50);
+  motorController.TurnRight(0);
+  delay(50);
+  motorStatus = motorStop;
+  
+  yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+  zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+  serialPrintSPI(yValue, zValue);
+  
+//========= Attach Interrupt Routine to Interrupt 0 =================== 
+  
+  delay(1000); // give time to make sure interrupt pin is pullet high
+  attachInterrupt(digitalPinToInterrupt(STOP_BUTTON), emergencyISR, FALLING);
+  
+//======= Check whether elevator is in correct reset position =========
+  
+  if (zValue < 10 && zValue > -10 && yValue < -1800) {
+    Serial.println("Valid reset parking position detected");
+    lcd.print("Reset position");
+    lcd.setCursor(0, 1);
+    lcd.print("Level 1");
+    lcd.setCursor(0, 3);
+    lcd.print("False interrupts: ");
+    lcd.setCursor(18, 3);
+    lcd.print(falseInterrupts);
+    controlLED(level);
+  } else {
+    Serial.println("Invalid reset parking position detected");
+    Serial.println("Moving to lowest level");
+    delay(1000);
+    lcd.clear();
+    moveMin(0); 
+  }
+  
+}
+
+//============================== Main Loop ===========================
+
+void loop() {
+  
+  event = checkButton();
+  
+  if (emergency == 1) {
+    emergencyStop();
+  } else if (event == longPressMode) {
+    testModeEnable = !testModeEnable;
+    lcd.clear();
+    if (testModeEnable == 1) {
+      Serial.println("Test mode enabled");
+      lcd.print("Test mode enabled");
+    } else {
+      Serial.println("Test mode disabled");
+      lcd.print("Test mode disabled");
+    }
+  } else if (event == shortPressMode) {
+    manualModeEnable = !manualModeEnable;
+    lcd.clear();
+    if (manualModeEnable == 1) {
+      Serial.println("Open loop mode");
+      lcd.print("Open loop mode");
+    } else {
+      Serial.println("Closed loop mode");
+      lcd.print("Closed loop mode");
+    }
+  } else if (manualModeEnable == 1) {
+    if (event == shortPressUp || event == shortPressDown) {
+      manualDrive();
+    }
+  } else {
+    switch (event)
+    {
+      case shortPressUp:
+        // Short press Up: Move one level up
+        yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+        zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+        serialPrintSPI(yValue, zValue);
+        if ((motorStatus == motorRun) && !(yValue > 1800)) {
+          lcd.clear();
+          moveUp(0); 
+        } else {
+          Serial.println("Top Level already reached");
+        }
+      break;
+
+      case longPressUp:
+        // Long press Up: Move to the highest level
+        if (motorStatus == motorRun) {
+          lcd.clear();
+          moveMax(0); 
+        }
+      break;
+      
+      case shortPressDown:
+        // Short press Down: Move one level down
+        yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+        zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+        serialPrintSPI(yValue, zValue);
+        if ((motorStatus == motorRun) && !(yValue < -1800)) {
+          lcd.clear();
+          moveDown(0); 
+        } else {
+          Serial.println("Bottom Level already reached");
+        }
+      break;
+
+      case longPressDown:
+        // Long press Down: Move to the lowest level
+       if (motorStatus == motorRun) {
+          lcd.clear();
+          moveMin(0); 
+        }
+        break;
+      case twoPressed:
+        //Two buttons pressed: No moving
+        Serial.println("Two buttons simultaneusly pressed, no valid event detected");
+      break;
+    }
+  }
+}
+
+//============ SPI READ COMMAND, returns an unsigned 16 bit int ============
+
+unsigned int readRegister(byte thisRegister, byte thisValueA, byte thisValueB, byte thisCommand) {
+  byte inByte = 0x0;    // incoming byte from the SPI
+  int16_t result = 0;   // result to return
+  unsigned char bytesToRead = 2;
+  byte dataToSend = thisRegister; // Previously concatinated the address and commmand, but we won't do this
+  digitalWrite(chipSelectPin, LOW);   // take the chip select low to select the device:
+  SPI.transfer(dataToSend); // sending address
+  result = SPI.transfer(thisValueA);
+  result = result << 8;   // shift the first byte, then get the second byte:
+  inByte = SPI.transfer(thisValueB);
+  SPI.transfer(thisCommand);
+  //Serial.println(thisValueB);
+  result = result | inByte;   // combine the byte you just got with the previous one:
+  //Serial.println(result);
+  digitalWrite(chipSelectPin, HIGH);   // take the chip select high to de-select:
+  return (result);
+}
+
+//======================= SPI WRITE COMMAND, returns nothing ================
+
+void writeRegister(byte thisRegister, byte thisValueA, byte thisValueB, byte thisCommand) { //we've rolled command and CRC into one byte
+  // take the chip select low to select the device:
+  digitalWrite(chipSelectPin, LOW);
+  // when we set an SPI.transfer to a variable it will fill up with what's coming in on MISO
+  byte writeResult = SPI.transfer(thisRegister); // we concatinated above, now we are sending the complete address
+  writeResult = SPI.transfer(thisValueA);  // thisValue is really 16 bits, but we've chopped it to send in chunks of 8 here
+  writeResult = SPI.transfer(thisValueB);
+  writeResult = SPI.transfer(thisCommand);
+  digitalWrite(chipSelectPin, HIGH);   // take the chip select high to de-select:
+}
+
+//================ SPI Print Sensor Results, returns nothing ================
+
+void serialPrintSPI(short signed y, short signed z) {
+    Serial.print(y);
+    Serial.print(", ");
+    Serial.println(z);
+}
+
+//================ Emergency stop and interrupt routine =====================
+
+void emergencyISR() {
+  byte stopState = 1;
+  for (int i = 0; i <= interruptDebounce; i++) {
+  }
+  stopState = digitalRead(STOP_BUTTON);
+  if (stopState == 0) {
+    emergency = 1;
+    state = 10;
+  } else {
+    falseInterrupts++;
+  }
+}
+
+void emergencyStop() {
+  motorController.TurnLeft(0);
+  delay(50);
+  motorController.TurnRight(0);
+  delay(50);
+  motorStatus = motorStop;
+  lcd.clear();
+  lcd.print("Emergency Stop");
+  Serial.println("Emergency Stop");
+  mcp.writePort(MCP23017Port::A, NOLED);
+  delay(100);
+  mcp.writePort(MCP23017Port::A, ERRORLED);
+  emergency = 0;
+}
+
+
+//========= Move the linear actuator until parkposition is reached ==========
+
+void moveMin (int parkPosition)
+{
+  state = 0;
+  
+  if (testModeEnable == 1) {
+    state = 10;
+    delay(1000);
+  } else {
+    motorController.TurnRight(fullSpeed);  // turn motor right
+    delay(50);
+  }
+  
+  // move ntil the bottom sensing area is reached
+  while (state == 0) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (zValue > max) {
+      state = 1;
+    }
+  }
+  
+  // state 1 stops for the motor, waits 1 sec, reverses direction and continues with slow speed
+  while (state == 1) {
+    Serial.println("Reverse Motor");
+    motorController.TurnRight(0);
+    delay(1000);
+    motorController.TurnLeft(slowSpeed);  // turn motor left
+    delay(50);
+    state = 2;
+  }
+  
+  // state 2 continues with slow speed until the park position is reached
+  while (state == 2) {
+      yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+      zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+      serialPrintSPI(yValue, zValue);
+    if (zValue < (parkPosition+10) && zValue > (parkPosition-10) && yValue < 1800) {
+      motorController.TurnLeft(0);
+      delay(50);
+      motorController.TurnRight(0);
+      delay(50);
+      state = 0;
+    }
+  }
+  Serial.println("Min position reached");
+  lcd.print("Min position reached");
+  lcd.setCursor(0, 1);
+  lcd.print("Level 1");
+  level = 1;
+  lcd.setCursor(0, 3);
+  lcd.print("False interrupts: ");
+  lcd.setCursor(18, 3);
+  lcd.print(falseInterrupts);
+  controlLED(level);
+  motorStatus = motorStop;
+}
+  
+void moveMax (int parkPosition)
+{
+  state = 0;
+  
+  if (testModeEnable == 1) {
+    state = 10;
+    delay(1000);
+  } else {
+    motorController.TurnLeft(fullSpeed);  // turn motor left
+    delay(50);
+  }
+  
+  // move intil the top sensing area is reached
+  while (state == 0) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (zValue > max) {
+      state = 1;
+    }
+  }
+  
+  // state 1 stops for the motor, waits 1 sec, reverses direction and continues with slow speed
+  while (state == 1) {
+    Serial.println("Reverse Motor");
+    motorController.TurnLeft(0);
+    delay(1000);
+    motorController.TurnRight(slowSpeed);  // turn motor left
+    delay(50);
+    state = 2;
+  }
+  
+  // state 2 continues with slow speed until the park position is reached
+  while (state == 2) {
+      yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+      zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+      serialPrintSPI(yValue, zValue);
+    if (zValue < (parkPosition+10) && zValue > (parkPosition-10) && yValue > 0) {
+      motorController.TurnLeft(0);
+      delay(50);
+      motorController.TurnRight(0);
+      delay(50);
+      state = 0;
+    }
+  }
+  Serial.println("Max position reached");
+  lcd.print("Max position reached");
+  lcd.setCursor(0, 1);
+  lcd.print("Level 6");
+  level = 6;
+  lcd.setCursor(0, 3);
+  lcd.print("False interrupts: ");
+  lcd.setCursor(18, 3);
+  lcd.print(falseInterrupts);
+  controlLED(level);
+  motorStatus = motorStop;
+} 
+
+void moveUp (int parkPosition)
+{
+  state = 0;
+  
+  if (testModeEnable == 1) {
+    state = 10;
+    delay(1000);
+  } else { 
+    motorController.TurnLeft(fullSpeed);  // turn motor left
+    delay(50);
+  }
+  
+  yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+  zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+  serialPrintSPI(yValue, zValue);
+  
+  if (testModeEnable == 0) {
+    if (yValue < 1800) {
+      state = 1;
+    } else {
+      state = 2;
+    }
+  }
+  
+  // state 1 continues moving until sensing zone is left
+  while (state == 1) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (yValue > 1000) {
+      state = 4;
+    }
+  }
+  
+  // state 2 continues moving until sensing zone is left
+  while (state == 2) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (yValue < 0) {
+      state = 6;
+    }
+  }
+  
+  // state 4 continues moving until y gets negative again
+  while (state == 4) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (yValue < -500) {
+      state = 5;
+    }
+  }
+  
+  // state 5 continues moving until sensing zone is reached
+  while (state == 5) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (yValue > 0) {
+      state = 6;
+    }
+  }
+  
+  // state 6 continues moving until next sensing zone is reached
+  while (state == 6) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    motorController.TurnLeft(slowSpeed);  // slow down motor
+    delay(50);
+    state = 3;
+  }
+  
+  // state 3 continues with slow speed until the park position is reached
+  while (state == 3) {
+      yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+      zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+      serialPrintSPI(yValue, zValue);
+    if (zValue < (parkPosition+10) && zValue > (parkPosition-10) && yValue > 0) {
+      motorController.TurnLeft(0);
+      delay(50);
+      motorController.TurnRight(0);
+      delay(50);
+      state = 0;
+    }
+  }
+  Serial.println("Parking reached");
+  lcd.print("Parking reached");
+  lcd.setCursor(0, 1);
+  lcd.print("Level ");
+  level = level + 1;
+  lcd.setCursor(6, 1);
+  lcd.print(level);
+  lcd.setCursor(0, 3);
+  lcd.print("False interrupts: ");
+  lcd.setCursor(18, 3);
+  lcd.print(falseInterrupts);
+  controlLED(level);
+  motorStatus = motorStop;
+}
+  
+
+void moveDown (int parkPosition)
+{
+  state = 0;
+  
+  if (testModeEnable == 1) {
+    state = 10;
+    delay(1000);
+  } else {
+    motorController.TurnRight(fullSpeed);  // turn motor right
+    delay(50);
+  }
+  
+  // state 0 continues moving until the sensing zone is left
+  while (state == 0) {
+      yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+      zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+      serialPrintSPI(yValue, zValue);
+    if (yValue < 0) {
+      state = 5;
+    }
+  }
+  
+  // state 5 continues moving until next sensing zone is reached
+  while (state == 5) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (yValue > 0 || yValue < -1800) {
+      motorController.TurnRight(slowSpeed);  // slow down motor
+      delay(50);
+      state = 3;
+    }
+  }
+  
+  // state 3 continues with slow speed until the park position is reached
+  while (state == 3) {
+    yValue = readRegister(Y_CH_RESULT, 0x00, 0x00, 0x00);
+    zValue = readRegister(Z_CH_RESULT, 0x00, 0x00, 0x00);
+    serialPrintSPI(yValue, zValue);
+    if (zValue < (parkPosition+10) && zValue > (parkPosition-10)) {
+      if (yValue > 0 || yValue < -1800) {
+        motorController.TurnLeft(0);
+        delay(50);
+        motorController.TurnRight(0);
+        delay(50);
+        state = 0;
+      }
+    }
+  }
+  Serial.println("Parking reached");
+  lcd.print("Parking reached");
+  lcd.setCursor(0, 1);
+  lcd.print("Level ");
+  level = level - 1;
+  lcd.setCursor(6, 1);
+  lcd.print(level);
+  lcd.setCursor(0, 3);
+  lcd.print("False interrupts: ");
+  lcd.setCursor(18, 3);
+  lcd.print(falseInterrupts);
+  controlLED(level);
+  motorStatus = motorStop;
+}
+
+void manualDrive ()
+{
+  lcd.clear();
+  if (event == shortPressUp) {
+    Serial.println("Manual drive up");
+    lcd.print("Manual drive up");
+    motorController.TurnLeft(fullSpeed);  // turn motor left
+  }
+  if (event == shortPressDown) {
+    Serial.println("Manual drive down");
+    lcd.print("Manual drive down");
+    motorController.TurnRight(fullSpeed);  // turn motor right
+  }
+  delay(50);
+  event = checkButton();
+  while ((event != shortPressUp) && (event != shortPressDown) && (emergency != 1)) {
+    event = checkButton();
+  }
+  motorController.TurnLeft(0);
+  delay(50);
+  lcd.clear();
+  Serial.println("Manual drive stop");
+  lcd.print("Manual drive stop");
+  motorStatus = motorStop;
+}
+
+//============ Turn on the correct LED base on elevator position ============
+
+void controlLED(byte led)
+{
+  switch (led)
+    {
+    case 1:
+      mcp.writePort(MCP23017Port::A, LED1);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED1);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED1);
+    break;
+    case 2:
+      mcp.writePort(MCP23017Port::A, LED2);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED2);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED2);
+    break;
+    case 3:
+      mcp.writePort(MCP23017Port::A, LED3);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED3);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED3);
+    break;
+    case 4:
+      mcp.writePort(MCP23017Port::A, LED4);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED4);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED4);
+    break;
+    case 5:
+      mcp.writePort(MCP23017Port::A, LED5);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED5);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED5);
+    break;
+    case 6:
+      mcp.writePort(MCP23017Port::A, LED6);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, CMDSENTLED + LED6);
+      delay(200);
+      mcp.writePort(MCP23017Port::A, LED6);
+    break;
+    }
+}
+
+//============== Evaluate the status of the UP and DOWN buttons =============
+
+byte checkButton()
+{
+  byte event = noEvent;
+  // Update the Bounce instance, does digitalRead of button
+  debounce_up.update();
+  debounce_down.update();
+  debounce_mode.update();
+
+  // Button press transition from HIGH to LOW)
+  if (debounce_up.fell())
+  {
+    buttonPressStartTimeStamp = millis();
+    startTimeout = true;
+    edge = fallingEdgeUp;
+  }
+  
+  if (debounce_down.fell())
+  {
+    buttonPressStartTimeStamp = millis();
+    startTimeout = true;
+    edge = fallingEdgeDown;
+  }
+  
+  if (debounce_mode.fell())
+  {
+    buttonPressStartTimeStamp = millis();
+    startTimeout = true;
+    edge = fallingEdgeMode;
+  }
+  
+  if (debounce_up.fell() && debounce_down.fell())
+  {
+    event = twoPressed;
+    edge = noValidEdge;
+  }
+
+  // Button release transition from LOW to HIGH) :
+  if (debounce_up.rose() && edge == fallingEdgeUp)
+  {
+    buttonPressDuration = (millis() - buttonPressStartTimeStamp);
+    startTimeout = false;
+  }
+  
+  if (debounce_down.rose() && edge == fallingEdgeDown)
+  {
+    buttonPressDuration = (millis() - buttonPressStartTimeStamp);
+    startTimeout = false;
+  }
+  
+  if (debounce_mode.rose() && edge == fallingEdgeMode)
+  {
+    buttonPressDuration = (millis() - buttonPressStartTimeStamp);
+    startTimeout = false;
+  }
+
+  if (buttonPressDuration > 0 && buttonPressDuration <= longTime)
+  {
+    if (edge == fallingEdgeUp) {
+      event = shortPressUp;
+    }
+    if (edge == fallingEdgeDown) {
+      event = shortPressDown;
+    }
+    if (edge == fallingEdgeMode) {
+      event = shortPressMode;
+    }
+    buttonPressDuration = 0;
+  }
+
+  if (startTimeout == true && (millis() - buttonPressStartTimeStamp) > longTime)
+  {
+    if (edge == fallingEdgeUp) {
+      event = longPressUp;
+    }
+    if (edge == fallingEdgeDown) {
+      event = longPressDown;
+    }
+    if (edge == fallingEdgeMode) {
+      event = longPressMode;
+    }
+    startTimeout = false;
+    buttonPressDuration = 0;
+  }
+  motorStatus = motorRun;
+  return event;
+}
