@@ -18,6 +18,7 @@ String release = "Release 1v4";
 Bug fix 1: no power on elevator after initialisation w/o highth adjustment
 Bug fix 2: wrong level after initialisation w/o highth adjustment
 Bug fix 3: get rid of false interrupt after initialisation
+Bug fix 4: changed max value from 4000 to 3800
 
 */
 
@@ -74,7 +75,7 @@ const byte fullSpeed = 255;
 const byte slowSpeed = 70;
 
 // Thresholds for maximum zValue when reaching top or bottom end
-const int max = 4000;
+const int max = 3800;
 
 #include <Bounce2.h>
 
@@ -838,3 +839,4 @@ byte checkButton()
   motorStatus = motorRun;
   return event;
 }
+
